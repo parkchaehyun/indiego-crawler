@@ -76,8 +76,8 @@ class TinyTicketCrawler(BaseCrawler):
                 print(f"Processing TinyTicket theater: {theater.name}")
                 
                 try:
-                    await page.goto(url)
-                    await page.wait_for_selector(".dateLabel", timeout=10000)
+                    await page.goto(url, wait_until="networkidle", timeout=60000)
+                    await page.wait_for_selector(".dateLabel", timeout=30000)
 
                     date_elements = await page.locator(".dateLabel").all()
                     for date_element in date_elements:
