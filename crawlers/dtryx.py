@@ -35,7 +35,7 @@ class DtryxCrawler(BaseCrawler):
                     resp.raise_for_status()
                     data = resp.json()
                 except Exception as e:
-                    print(f"[{theater.cinema_code}] API request failed: {e}")
+                    print(f"[{theater.cinema_code}] API request failed: {type(e).__name__} {repr(e)}")
                     continue
 
                 for item in data.get("Showseqlist", []):
