@@ -154,6 +154,14 @@
         "brand_cd": "spacedog"
     },
     {
+        "cinema_code": "000160",
+        "name": "서울영화센터",
+        "chain": "Dtryx",
+        "latitude": 37.564242,
+        "longitude": 126.992102,
+        "brand_cd": "seoulcc"
+    },
+    {
         "cinema_code": "0081",
         "name": "픽쳐하우스",
         "chain": "Megabox",
