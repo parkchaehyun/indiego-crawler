@@ -8,3 +8,5 @@ crawlers/__pycache__/
 app/
 
 .idea/
+
+cinemas.csv
