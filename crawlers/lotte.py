@@ -22,6 +22,59 @@ _HEADERS = {
     ),
 }
 
+# Seoul = "0001" in Lotte's DetailDivisionCode taxonomy.
+SEOUL_DETAIL_DIVISION_CODE = "0001"
+
+
+def _extract_lotte_cinema_items(data: dict) -> list[dict]:
+    cinemas = data.get("Cinemas") or {}
+    nested = cinemas.get("Cinemas") or {}
+    return nested.get("Items") or cinemas.get("Items") or []
+
+
+def fetch_lotte_cinema_list(
+    detail_division_code: str | None = SEOUL_DETAIL_DIVISION_CODE,
+) -> list[dict]:
+    """Fetch Lotte Cinema's booking cinema list once.
+
+    Returns raw cinema rows containing CinemaID, CinemaNameKR, Latitude, and
+    Longitude. Pass detail_division_code=None to get every region; defaults to
+    Seoul ('0001').
+    """
+    param = {
+        "MethodName": "GetTicketingPageTOBE",
+        "channelType": "HO",
+        "osType": "W",
+        "osVersion": "Chrome",
+        "memberOnNo": "",
+    }
+    r = httpx.post(
+        _URL,
+        data={"ParamList": json.dumps(param)},
+        headers=_HEADERS,
+        timeout=15.0,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Lotte cinema list HTTP {r.status_code}: {r.text[:200]}"
+        )
+
+    cinemas: list[dict] = []
+    seen: set[str] = set()
+    for item in _extract_lotte_cinema_items(r.json()):
+        cinema_id = str(item.get("CinemaID") or "").strip()
+        name = str(item.get("CinemaNameKR") or "").strip()
+        row_region = str(item.get("DetailDivisionCode") or "").strip()
+        if not cinema_id or not name:
+            continue
+        if detail_division_code is not None and row_region != detail_division_code:
+            continue
+        if cinema_id in seen:
+            continue
+        seen.add(cinema_id)
+        cinemas.append(item)
+    return cinemas
+
 
 class LotteCinemaCrawler(BaseCrawler):
     chain: Chain = "Lotte"
@@ -161,4 +214,3 @@ class LotteCinemaCrawler(BaseCrawler):
                             print(f"  ⚠ skip malformed item ({theater.name}): {e}")
 
         return screenings
-

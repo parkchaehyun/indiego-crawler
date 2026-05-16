@@ -12,6 +12,7 @@ from models import Cinema, Chain, Screening
 
 
 _URL = "https://www.megabox.co.kr/on/oh/ohc/Brch/schedulePage.do"
+_BOOKING_LIST_URL = "https://www.megabox.co.kr/on/oh/ohb/SimpleBooking/selectBokdList.do"
 _HEADERS = {
     "Content-Type": "application/json",
     "X-Requested-With": "XMLHttpRequest",
@@ -23,6 +24,51 @@ _HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
 }
+
+# Seoul = "10" in Megabox's areaCd taxonomy.
+SEOUL_AREA_CODE = "10"
+
+
+def fetch_megabox_cinema_list(area_code: str | None = SEOUL_AREA_CODE) -> list[dict]:
+    """Fetch Megabox's booking cinema list once.
+
+    Returns: list of {'brchNo', 'brchNm', 'areaCd'} dicts. Pass area_code=None
+    to get every area; defaults to Seoul ('10').
+    """
+    play_de = dt.date.today().strftime("%Y%m%d")
+    body = {
+        "playDe": play_de,
+        "incomeMovieNo": "",
+        "brchNo": "",
+        "areaCd": "",
+        "brchNo1": "",
+        "movieNo": "",
+        "movieNo1": "",
+        "onLoad": "Y",
+    }
+    r = httpx.post(_BOOKING_LIST_URL, json=body, headers=_HEADERS, timeout=15.0)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Megabox cinema list HTTP {r.status_code}: {r.text[:200]}"
+        )
+
+    data = r.json()
+    items = data.get("areaBrchList") or (data.get("megaMap") or {}).get("areaBrchList") or []
+    cinemas: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        brch_no = str(item.get("brchNo") or "").strip()
+        brch_nm = html.unescape(str(item.get("brchNm") or "")).strip()
+        row_area = str(item.get("areaCd") or "").strip()
+        if not brch_no or not brch_nm:
+            continue
+        if area_code is not None and row_area != area_code:
+            continue
+        if brch_no in seen:
+            continue
+        seen.add(brch_no)
+        cinemas.append({"brchNo": brch_no, "brchNm": brch_nm, "areaCd": row_area})
+    return cinemas
 
 
 class MegaboxCrawler(BaseCrawler):
@@ -157,4 +203,3 @@ class MegaboxCrawler(BaseCrawler):
                     screenings.extend(self._items_to_screenings(theater, items, crawl_ts))
 
         return screenings
-
