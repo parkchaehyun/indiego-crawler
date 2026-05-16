@@ -5,7 +5,7 @@ from crawlers.supabase_client import SupabaseClient
 def lambda_handler(event, context):
     chains = event.get(
         "chains",
-        ["CGV", "Megabox", "Lotte", "TinyTicket", "Dtryx", "Moviee", "KOFA"],
+        ["CGV", "Megabox", "Lotte", "CineQ", "TinyTicket", "Dtryx", "Moviee", "KOFA"],
     )
     supabase = SupabaseClient()
 

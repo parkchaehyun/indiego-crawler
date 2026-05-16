@@ -5,7 +5,7 @@
 This repo contains two AWS Lambda container functions:
 
 1. `crawler` Lambda
-- Crawls screenings from: `CGV`, `Megabox`, `Lotte`, `Dtryx`, `Moviee`, `TinyTicket`, `KOFA`
+- Crawls screenings from: `CGV`, `Megabox`, `Lotte`, `CineQ`, `Dtryx`, `Moviee`, `TinyTicket`, `KOFA`
 - Normalizes rows into a shared `Screening` model
 - Upserts into Supabase (`screenings`, with `cinemas` as reference data)
 
@@ -40,7 +40,7 @@ Key runtime facts:
 - Crawler image uses Playwright Python base image with Chromium.
 - TMDB image is lightweight (`public.ecr.aws/lambda/python:3.11`).
 - Default crawler event:
-  - `chains`: `["CGV", "Megabox", "Lotte", "TinyTicket", "Dtryx", "Moviee", "KOFA"]`
+  - `chains`: `["CGV", "Megabox", "Lotte", "CineQ", "TinyTicket", "Dtryx", "Moviee", "KOFA"]`
 - Each crawler discovers its own operational date list from the chain's API,
   so there is no fixed-window parameter — every bookable screening is fetched.
 
@@ -58,7 +58,7 @@ Key runtime facts:
 ## Data Model (Code)
 
 `models.py` currently defines:
-- `Chain = Literal["CGV", "Megabox", "Lotte", "TinyTicket", "Dtryx", "Moviee", "KOFA"]`
+- `Chain = Literal["CGV", "Megabox", "Lotte", "CineQ", "TinyTicket", "Dtryx", "Moviee", "KOFA"]`
 - `Screening` fields include:
   - core fields: `provider`, `cinema_name`, `cinema_code`, `screen_name`, `movie_title`, `play_date`, `start_dt`, `end_dt`
   - enrichment: `movie_title_en`, `source_movie_code`, `source_year`, `source_director`
@@ -109,6 +109,7 @@ root/
 ├── crawlers/
 │   ├── base.py
 │   ├── cgv.py
+│   ├── cineq.py
 │   ├── crawler_registry.py
 │   ├── dtryx.py
 │   ├── kofa.py

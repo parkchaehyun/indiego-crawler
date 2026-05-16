@@ -2,7 +2,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 import uuid
 
-Chain = Literal["CGV", "Megabox", "Lotte", "TinyTicket", "Dtryx", "Moviee", "KOFA"]
+Chain = Literal["CGV", "Megabox", "Lotte", "CineQ", "TinyTicket", "Dtryx", "Moviee", "KOFA"]
 
 
 class Screening(BaseModel):

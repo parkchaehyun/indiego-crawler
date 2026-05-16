@@ -4,6 +4,7 @@ from crawlers.base import BaseCrawler
 from crawlers.cgv import CGVCrawler
 from crawlers.megabox import MegaboxCrawler
 from crawlers.lotte import LotteCinemaCrawler
+from crawlers.cineq import CineQCrawler
 from crawlers.dtryx import DtryxCrawler
 from crawlers.moviee import MovieeCrawler
 from crawlers.tinyticket import TinyTicketCrawler
@@ -15,6 +16,7 @@ class CrawlerRegistry:
         "CGV": CGVCrawler,
         "Megabox": MegaboxCrawler,
         "Lotte": LotteCinemaCrawler,
+        "CineQ": CineQCrawler,
         "Dtryx": DtryxCrawler,
         "Moviee": MovieeCrawler,
         "TinyTicket": TinyTicketCrawler,

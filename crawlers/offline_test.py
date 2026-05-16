@@ -6,7 +6,7 @@ from pathlib import Path
 from crawlers.crawler_registry import CrawlerRegistry
 
 
-AVAILABLE_CHAINS = ("CGV", "Megabox", "Lotte", "Dtryx", "Moviee", "TinyTicket", "KOFA")
+AVAILABLE_CHAINS = ("CGV", "Megabox", "Lotte", "CineQ", "Dtryx", "Moviee", "TinyTicket", "KOFA")
 
 
 class DummySupabase:
