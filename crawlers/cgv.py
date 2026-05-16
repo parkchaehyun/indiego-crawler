@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import dataclasses
 import datetime as dt
 import hashlib
 import hmac
@@ -41,16 +43,11 @@ def _sign(path: str, body: str = "") -> dict[str, str]:
     return {"x-timestamp": ts, "x-signature": sig}
 
 
-class _NullCM:
-    async def __aenter__(self): return None
-    async def __aexit__(self, *a): return False
-
-
 class _RateLimiter:
     """Enforces a minimum interval between request starts, independent of latency.
 
     CGV's per-IP limit measured ~5 q/s over a ~15s sliding window before sustained
-    429s. We target 2.5 q/s (400ms interval) for ~2x safety margin.
+    429s. We target 2.5 q/s per IP (400ms interval) for ~2x safety margin.
     """
 
     def __init__(self, min_interval: float):
@@ -68,6 +65,19 @@ class _RateLimiter:
             self._next_allowed = now + self._min_interval
 
 
+@dataclasses.dataclass
+class _Worker:
+    """One proxy IP (or direct) with its own session, rate limiter, and semaphore.
+
+    CGV's rate limit is per source IP, so each worker enforces its own pacing.
+    Multiple workers run in parallel to multiply effective throughput.
+    """
+    label: str
+    session: AsyncSession
+    sem: asyncio.Semaphore
+    limiter: _RateLimiter
+
+
 class CGVCrawler(BaseCrawler):
     chain: Chain = "CGV"
 
@@ -76,10 +86,14 @@ class CGVCrawler(BaseCrawler):
         if not self.theaters:
             raise ValueError("No CGV theaters found")
 
-    async def _fetch_proxy(self) -> str | None:
+    async def _fetch_proxies(self, want: int) -> list[tuple[str, str]]:
+        """Return up to `want` Webshare proxies as (url, label) pairs.
+
+        Returns empty list if no API key or fetch fails — caller falls back to direct.
+        """
         api_key = os.getenv("WEBSHARE_API_KEY")
         if not api_key:
-            return None
+            return []
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
@@ -91,19 +105,23 @@ class CGVCrawler(BaseCrawler):
             valid = [p for p in resp.json()["results"] if p.get("valid")]
             if not valid:
                 raise ValueError("no valid proxies in list")
-            p = random.choice(valid)
-            return f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
+            chosen = random.sample(valid, k=min(want, len(valid)))
+            return [
+                (
+                    f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}",
+                    f"{p['proxy_address']}:{p['port']}",
+                )
+                for p in chosen
+            ]
         except Exception as e:
             print(f"  ⚠ Webshare proxy fetch failed: {e}. Proceeding without proxy.")
-            return None
+            return []
 
     async def _get_signed(
         self,
-        session: AsyncSession,
+        worker: _Worker,
         path: str,
         params: dict,
-        sem: asyncio.Semaphore,
-        limiter: _RateLimiter,
     ) -> dict:
         url = f"{_API_BASE}{path}"
         # Retry on 429 with backoff long enough to clear CGV's sliding window
@@ -112,10 +130,12 @@ class CGVCrawler(BaseCrawler):
         last_status = None
         last_body = ""
         for attempt in range(len(delays) + 1):
-            await limiter.acquire()
+            await worker.limiter.acquire()
             headers = {**_BASE_HEADERS, **_sign(path)}
-            async with sem:
-                r = await session.get(url, params=params, headers=headers, timeout=15)
+            async with worker.sem:
+                r = await worker.session.get(
+                    url, params=params, headers=headers, timeout=15
+                )
             if r.status_code == 200:
                 return r.json()
             last_status, last_body = r.status_code, r.text[:200]
@@ -123,23 +143,15 @@ class CGVCrawler(BaseCrawler):
                 break
             await asyncio.sleep(delays[attempt])
         raise RuntimeError(
-            f"CGV API {path} returned {last_status} after retries: {last_body}"
+            f"CGV API {path} [{worker.label}] returned {last_status} after retries: {last_body}"
         )
 
-    async def _fetch_dates(
-        self,
-        session: AsyncSession,
-        site_no: str,
-        sem: asyncio.Semaphore,
-        limiter: _RateLimiter,
-    ) -> list[str]:
+    async def _fetch_dates(self, worker: _Worker, site_no: str) -> list[str]:
         try:
             data = await self._get_signed(
-                session,
+                worker,
                 "/cnm/atkt/searchSiteScnscYmdListBySite",
                 {"coCd": "A420", "siteNo": site_no},
-                sem=sem,
-                limiter=limiter,
             )
         except Exception as e:
             print(f"  ⚠ dates fetch failed for siteNo={site_no}: {e}")
@@ -148,20 +160,13 @@ class CGVCrawler(BaseCrawler):
         return [r["scnYmd"] for r in rows if r.get("scnYmd")]
 
     async def _fetch_screenings(
-        self,
-        session: AsyncSession,
-        site_no: str,
-        scn_ymd: str,
-        sem: asyncio.Semaphore,
-        limiter: _RateLimiter,
+        self, worker: _Worker, site_no: str, scn_ymd: str
     ) -> list[dict]:
         try:
             data = await self._get_signed(
-                session,
+                worker,
                 "/cnm/atkt/searchMovScnInfo",
                 {"coCd": "A420", "siteNo": site_no, "scnYmd": scn_ymd, "rtctlScopCd": "08"},
-                sem=sem,
-                limiter=limiter,
             )
         except Exception as e:
             print(f"  ⚠ schedule fetch failed for siteNo={site_no} date={scn_ymd}: {e}")
@@ -205,23 +210,46 @@ class CGVCrawler(BaseCrawler):
         # which days CGV has booking open. start_date acts as a lower-bound filter only.
         screenings: list[Screening] = []
         crawl_ts = dt.datetime.utcnow()
-        proxy = await self._fetch_proxy()
-        if proxy:
-            print("  Using Webshare proxy for CGV crawl.")
 
-        # CGV rate-limits per-IP: ~5 q/s for ~15s before sustained 429s.
-        # Pace at 2.5 q/s (400ms interval) for ~2x safety; sem caps burst at 2.
-        sem = asyncio.Semaphore(2)
-        limiter = _RateLimiter(min_interval=0.4)
-        session_kwargs: dict = {"impersonate": "chrome124", "max_clients": 4}
-        if proxy:
-            session_kwargs["proxy"] = proxy
+        # Each proxy IP gives ~2.5 q/s sustained, so total throughput scales with N.
+        # Default of 4 keeps headroom in a 10-proxy Webshare pool; tune via env var.
+        proxy_count = int(os.getenv("CGV_PROXY_COUNT", "4"))
+        proxies = await self._fetch_proxies(proxy_count) if proxy_count > 0 else []
 
-        async with AsyncSession(**session_kwargs) as session:
+        async with contextlib.AsyncExitStack() as stack:
+            workers: list[_Worker] = []
+            if proxies:
+                for url, label in proxies:
+                    session = await stack.enter_async_context(
+                        AsyncSession(impersonate="chrome124", max_clients=4, proxy=url)
+                    )
+                    workers.append(_Worker(
+                        label=label,
+                        session=session,
+                        sem=asyncio.Semaphore(2),
+                        limiter=_RateLimiter(min_interval=0.4),
+                    ))
+                print(f"  Using {len(workers)} Webshare proxies in parallel.")
+            else:
+                session = await stack.enter_async_context(
+                    AsyncSession(impersonate="chrome124", max_clients=4)
+                )
+                workers.append(_Worker(
+                    label="direct",
+                    session=session,
+                    sem=asyncio.Semaphore(2),
+                    limiter=_RateLimiter(min_interval=0.4),
+                ))
+                print("  No proxies — using direct connection.")
+
+            def worker_for(i: int) -> _Worker:
+                return workers[i % len(workers)]
+
             print(f"  Fetching operational dates for {len(self.theaters)} theaters...")
-            date_lists = await asyncio.gather(
-                *[self._fetch_dates(session, t.cinema_code, sem, limiter) for t in self.theaters]
-            )
+            date_lists = await asyncio.gather(*[
+                self._fetch_dates(worker_for(i), t.cinema_code)
+                for i, t in enumerate(self.theaters)
+            ])
 
             jobs: list[tuple[Cinema, str]] = []
             cutoff = start_date.strftime("%Y%m%d") if start_date else None
@@ -243,13 +271,11 @@ class CGVCrawler(BaseCrawler):
             if not jobs:
                 return []
 
-            print(f"  Fetching schedules for {len(jobs)} (theater × date) pairs...")
-            payloads = await asyncio.gather(
-                *[
-                    self._fetch_screenings(session, t.cinema_code, d, sem, limiter)
-                    for t, d in jobs
-                ]
-            )
+            print(f"  Fetching schedules for {len(jobs)} (theater × date) pairs across {len(workers)} worker(s)...")
+            payloads = await asyncio.gather(*[
+                self._fetch_screenings(worker_for(i), t.cinema_code, d)
+                for i, (t, d) in enumerate(jobs)
+            ])
 
         seen: set[tuple] = set()
         per_theater: dict[str, int] = {}
