@@ -1,51 +1,82 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime as dt
+import hashlib
+import hmac
 import os
-from pathlib import Path
+import random
+import time
 from typing import Iterable
-from urllib.parse import urlparse
 
 import httpx
-import random
-from playwright.async_api import async_playwright, Browser, TimeoutError as PlaywrightTimeoutError
+from curl_cffi.requests import AsyncSession
 
 from crawlers.base import BaseCrawler
 from models import Screening, Chain, Cinema
 from crawlers.supabase_client import SupabaseClient
 
 
-class CGVAccessBlockedError(RuntimeError):
-    """Raised when CGV serves an access-block page."""
+# HMAC secret extracted from CGV's Next.js bundle (chunks/1453-*.js).
+# If signed requests start returning 401 (not 403/Cloudflare), it's been rotated —
+# re-extract by grepping the bundle for HmacSHA256, then update CGV_SIGN_SECRET.
+_SIGN_SECRET = os.environ["CGV_SIGN_SECRET"].encode()
+_API_BASE = "https://api.cgv.co.kr"
+_BASE_HEADERS = {
+    "accept": "application/json",
+    "accept-language": "ko-KR",
+    "origin": "https://cgv.co.kr",
+    "referer": "https://cgv.co.kr/",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+}
+
+
+def _sign(path: str, body: str = "") -> dict[str, str]:
+    ts = str(int(time.time()))
+    msg = f"{ts}|{path}|{body}".encode()
+    sig = base64.b64encode(hmac.new(_SIGN_SECRET, msg, hashlib.sha256).digest()).decode()
+    return {"x-timestamp": ts, "x-signature": sig}
+
+
+class _NullCM:
+    async def __aenter__(self): return None
+    async def __aexit__(self, *a): return False
+
+
+class _RateLimiter:
+    """Enforces a minimum interval between request starts, independent of latency.
+
+    CGV's per-IP limit measured ~5 q/s over a ~15s sliding window before sustained
+    429s. We target 2.5 q/s (400ms interval) for ~2x safety margin.
+    """
+
+    def __init__(self, min_interval: float):
+        self._min_interval = min_interval
+        self._next_allowed = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            wait = self._next_allowed - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = asyncio.get_event_loop().time()
+            self._next_allowed = now + self._min_interval
 
 
 class CGVCrawler(BaseCrawler):
     chain: Chain = "CGV"
-    block_markers = (
-        "비정상적으로 CGV에 접속한 것이 확인되어 이용이 제한되었어요",
-        "RAY_ID",
-        "CLIENT_IP",
-    )
-    modal_selector_candidates = (
-        ".cgv-bot-modal.active",
-        ".cgv-bot-modal",
-        "div[class*='bot-modal']",
-    )
 
     def __init__(self, supabase: SupabaseClient, batch_size: int = 10):
         super().__init__(supabase=supabase, batch_size=batch_size)
         if not self.theaters:
             raise ValueError("No CGV theaters found")
 
-    @staticmethod
-    def _env_bool(name: str, default: bool = False) -> bool:
-        raw = os.getenv(name)
-        if raw is None:
-            return default
-        return raw.lower() in {"1", "true", "yes", "on"}
-
-    async def _fetch_proxy(self) -> dict | None:
+    async def _fetch_proxy(self) -> str | None:
         api_key = os.getenv("WEBSHARE_API_KEY")
         if not api_key:
             return None
@@ -57,541 +88,195 @@ class CGVCrawler(BaseCrawler):
                     headers={"Authorization": f"Token {api_key}"},
                 )
                 resp.raise_for_status()
-            proxies = [p for p in resp.json()["results"] if p.get("valid")]
-            if not proxies:
-                raise ValueError("No valid proxies in list")
-            p = random.choice(proxies)
-            return {
-                "server": f"http://{p['proxy_address']}:{p['port']}",
-                "username": p["username"],
-                "password": p["password"],
-            }
+            valid = [p for p in resp.json()["results"] if p.get("valid")]
+            if not valid:
+                raise ValueError("no valid proxies in list")
+            p = random.choice(valid)
+            return f"http://{p['username']}:{p['password']}@{p['proxy_address']}:{p['port']}"
         except Exception as e:
-            print(f"⚠ Could not fetch proxy list: {e}. Proceeding without proxy.")
+            print(f"  ⚠ Webshare proxy fetch failed: {e}. Proceeding without proxy.")
             return None
+
+    async def _get_signed(
+        self,
+        session: AsyncSession,
+        path: str,
+        params: dict,
+        sem: asyncio.Semaphore,
+        limiter: _RateLimiter,
+    ) -> dict:
+        url = f"{_API_BASE}{path}"
+        # Retry on 429 with backoff long enough to clear CGV's sliding window
+        # (~15s). Re-sign each attempt so x-timestamp stays current.
+        delays = (5.0, 15.0, 30.0)
+        last_status = None
+        last_body = ""
+        for attempt in range(len(delays) + 1):
+            await limiter.acquire()
+            headers = {**_BASE_HEADERS, **_sign(path)}
+            async with sem:
+                r = await session.get(url, params=params, headers=headers, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            last_status, last_body = r.status_code, r.text[:200]
+            if r.status_code != 429 or attempt == len(delays):
+                break
+            await asyncio.sleep(delays[attempt])
+        raise RuntimeError(
+            f"CGV API {path} returned {last_status} after retries: {last_body}"
+        )
+
+    async def _fetch_dates(
+        self,
+        session: AsyncSession,
+        site_no: str,
+        sem: asyncio.Semaphore,
+        limiter: _RateLimiter,
+    ) -> list[str]:
+        try:
+            data = await self._get_signed(
+                session,
+                "/cnm/atkt/searchSiteScnscYmdListBySite",
+                {"coCd": "A420", "siteNo": site_no},
+                sem=sem,
+                limiter=limiter,
+            )
+        except Exception as e:
+            print(f"  ⚠ dates fetch failed for siteNo={site_no}: {e}")
+            return []
+        rows = data.get("data") or []
+        return [r["scnYmd"] for r in rows if r.get("scnYmd")]
+
+    async def _fetch_screenings(
+        self,
+        session: AsyncSession,
+        site_no: str,
+        scn_ymd: str,
+        sem: asyncio.Semaphore,
+        limiter: _RateLimiter,
+    ) -> list[dict]:
+        try:
+            data = await self._get_signed(
+                session,
+                "/cnm/atkt/searchMovScnInfo",
+                {"coCd": "A420", "siteNo": site_no, "scnYmd": scn_ymd, "rtctlScopCd": "08"},
+                sem=sem,
+                limiter=limiter,
+            )
+        except Exception as e:
+            print(f"  ⚠ schedule fetch failed for siteNo={site_no} date={scn_ymd}: {e}")
+            return []
+        return data.get("data") or []
+
+    def _to_screening(
+        self, theater: Cinema, item: dict, crawl_ts: dt.datetime
+    ) -> Screening:
+        scn_ymd = item["scnYmd"]
+        theater_name_param = theater.name.replace("CGV", "").strip()
+        url = (
+            "https://cgv.co.kr/cnm/movieBook/movie?"
+            f'movNo={item["movNo"]}&scnYmd={scn_ymd}&siteNo={item["siteNo"]}&'
+            f'siteNm={theater_name_param}&scnsNo={item["scnsNo"]}&scnSseq={item["scnSseq"]}'
+        )
+        return Screening(
+            provider=self.chain,
+            cinema_name=theater.name,
+            # Use the configured theater code as canonical key.
+            # CGV's payload `siteNo` can differ from `cinema_code` and break joins.
+            cinema_code=theater.cinema_code,
+            screen_name=item["scnsNm"],
+            movie_title=item["movNm"],
+            movie_title_en=(item.get("movEnm") or "").strip() or None,
+            source_movie_code=str(item.get("movNo") or "").strip() or None,
+            is_core_art_screen=item.get("sascnsGradNm") == "아트하우스",
+            start_dt=f'{item["scnsrtTm"][:2]}:{item["scnsrtTm"][2:]}',
+            end_dt=f'{item["scnendTm"][:2]}:{item["scnendTm"][2:]}',
+            play_date=f"{scn_ymd[:4]}-{scn_ymd[4:6]}-{scn_ymd[6:]}",
+            crawl_ts=crawl_ts.isoformat(),
+            url=url,
+            remain_seat_cnt=int(item["frSeatCnt"]),
+            total_seat_cnt=int(item["stcnt"]),
+        )
 
     async def run(
         self, start_date: dt.date | None = None, max_days: int | None = None
     ) -> list[Screening]:
-        screenings = []
+        # max_days is intentionally ignored: the dates endpoint tells us exactly
+        # which days CGV has booking open. start_date acts as a lower-bound filter only.
+        screenings: list[Screening] = []
         crawl_ts = dt.datetime.utcnow()
-        headless = os.getenv("CGV_HEADLESS", "1").lower() not in {"0", "false", "no"}
         proxy = await self._fetch_proxy()
         if proxy:
             print("  Using Webshare proxy for CGV crawl.")
-        else:
-            print("  No proxy configured — proceeding without proxy.")
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=headless,
-                args=[
-                    "--disable-gpu",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--no-zygote",
-                    "--disable-setuid-sandbox",
-                    "--disable-accelerated-2d-canvas",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-background-networking",
-                    "--disable-background-timer-throttling",
-                    "--disable-client-side-phishing-detection",
-                    "--disable-component-update",
-                    "--disable-default-apps",
-                    "--disable-domain-reliability",
-                    "--disable-features=AudioServiceOutOfProcess",
-                    "--disable-hang-monitor",
-                    "--disable-ipc-flooding-protection",
-                    "--disable-popup-blocking",
-                    "--disable-prompt-on-repost",
-                    "--disable-renderer-backgrounding",
-                    "--disable-sync",
-                    "--force-color-profile=srgb",
-                    "--metrics-recording-only",
-                    "--mute-audio",
-                    "--no-pings",
-                    "--use-gl=swiftshader",
-                    "--window-size=1280,1696",
-                ],
-            )
-
-            for i in range(0, len(self.theaters), self.batch_size):
-                batch = self.theaters[i : i + self.batch_size]
-                for theater_index, theater in enumerate(batch):
-                    try:
-                        theater_screenings = await self.crawl_theater(
-                            browser, theater, theater_index, len(batch), crawl_ts, proxy
-                        )
-                    except CGVAccessBlockedError as exc:
-                        print(f"❌ {exc}")
-                        print("❌ Stopping CGV crawl early due to access block.")
-                        return screenings
-                    screenings.extend(theater_screenings)
-                    await asyncio.sleep(0)
-
-        return screenings
-
-    async def _is_access_blocked(self, page) -> bool:
-        try:
-            text = await page.inner_text("body")
-        except Exception:
-            return False
-        normalized = (text or "").replace(" ", "")
-        return any(marker.replace(" ", "") in normalized for marker in self.block_markers)
-
-    async def _wait_for_theater_modal(self, page) -> str:
-        for selector in self.modal_selector_candidates:
-            try:
-                await page.wait_for_selector(selector, timeout=7000)
-                return selector
-            except Exception:
-                if await self._is_access_blocked(page):
-                    raise CGVAccessBlockedError(
-                        "CGV blocked automated access on /cnm/movieBook/cinema."
-                    )
-
-        if await self._is_access_blocked(page):
-            raise CGVAccessBlockedError(
-                "CGV blocked automated access on /cnm/movieBook/cinema."
-            )
-        raise RuntimeError(
-            "CGV theater modal not found. Selector may have changed."
-        )
-
-    async def _dump_debug_artifacts(self, page, theater_code: str):
-        debug_dir = (
-            Path("/tmp/cgv_debug")
-            if os.getenv("AWS_LAMBDA_FUNCTION_NAME")
-            else Path("tmp_chain_samples_escalated")
-        )
-        try:
-            debug_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            print(f"  Could not create debug dir ({debug_dir}): {e}")
-            return
-        timestamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-
-        screenshot_path = debug_dir / f"cgv_debug_{theater_code}_{timestamp}.png"
-        html_path = debug_dir / f"cgv_debug_{theater_code}_{timestamp}.html"
-
-        try:
-            await page.screenshot(path=str(screenshot_path), full_page=True)
-            print(f"  Saved debug screenshot: {screenshot_path}")
-        except Exception:
-            pass
-
-        try:
-            html_path.write_text(await page.content(), encoding="utf-8")
-            print(f"  Saved debug html: {html_path}")
-        except Exception:
-            pass
-
-    async def crawl_theater(
-        self,
-        browser: Browser,
-        theater: Cinema,
-        theater_index: int,
-        batch_size: int,
-        crawl_ts: dt.datetime,
-        proxy: dict | None = None,
-    ) -> list[Screening]:
-        # Create a new browser context with a realistic User-Agent and locale
-        context_kwargs = dict(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-        )
+        # CGV rate-limits per-IP: ~5 q/s for ~15s before sustained 429s.
+        # Pace at 2.5 q/s (400ms interval) for ~2x safety; sem caps burst at 2.
+        sem = asyncio.Semaphore(2)
+        limiter = _RateLimiter(min_interval=0.4)
+        session_kwargs: dict = {"impersonate": "chrome124", "max_clients": 4}
         if proxy:
-            context_kwargs["proxy"] = proxy
-        context = await browser.new_context(**context_kwargs)
-        # Inject basic stealth to hide navigator.webdriver
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-        page = await context.new_page()
-        bandwidth_saver = self._env_bool("CGV_BANDWIDTH_SAVER", default=False)
-        blocked_counts = {"font": 0, "tracker": 0, "image": 0}
-        tracker_hosts = {
-            "www.googletagmanager.com",
-            "analytics.google.com",
-            "stats.g.doubleclick.net",
-            "ad.cgv.co.kr",
-            "www.google.co.kr",
-        }
-        route_handler = None
-        if bandwidth_saver:
-            async def _route_with_bandwidth_saver(route):
-                req = route.request
-                host = urlparse(req.url).netloc
-                rtype = req.resource_type
+            session_kwargs["proxy"] = proxy
 
-                if host in tracker_hosts:
-                    blocked_counts["tracker"] += 1
-                    await route.abort()
-                    return
-                if rtype == "font":
-                    blocked_counts["font"] += 1
-                    await route.abort()
-                    return
-                if rtype == "image":
-                    blocked_counts["image"] += 1
-                    await route.abort()
-                    return
-                await route.continue_()
-            route_handler = _route_with_bandwidth_saver
-        screenings = []
-
-        try:
-            theater_name_for_click = theater.name.replace("CGV", "").strip()
-            print(
-                f"Processing theater {theater_index + 1}/{batch_size}: {theater.name}"
+        async with AsyncSession(**session_kwargs) as session:
+            print(f"  Fetching operational dates for {len(self.theaters)} theaters...")
+            date_lists = await asyncio.gather(
+                *[self._fetch_dates(session, t.cinema_code, sem, limiter) for t in self.theaters]
             )
 
-            # Track API payloads deterministically (no background callbacks).
-            theater_data = []
-            seen_schedule_keys = set()
-
-            def is_schedule_response(response) -> bool:
-                return (
-                    "searchMovScnInfo" in response.url
-                    and f"siteNo={theater.cinema_code}" in response.url
-                )
-
-            async def append_from_response(response) -> int:
-                try:
-                    import re
-
-                    date_match = re.search(r"scnYmd=(\d{8})", response.url)
-                    date = date_match.group(1) if date_match else "unknown"
-
-                    data = await response.json()
-                    if not (data and data.get("statusCode") == 0 and data.get("data")):
-                        print(f"    API returned no data for date {date}")
-                        return 0
-
-                    payload = data["data"]
-                    new_unique = 0
-                    for item in payload:
-                        key = (
-                            item.get("siteNo"),
-                            item.get("movNo"),
-                            item.get("scnYmd"),
-                            item.get("scnsNo"),
-                            item.get("scnSseq"),
-                            item.get("scnsrtTm"),
-                        )
-                        if key in seen_schedule_keys:
-                            continue
-                        seen_schedule_keys.add(key)
-                        theater_data.append(item)
-                        new_unique += 1
-
-                    print(
-                        f"    API loaded {len(payload)} screenings for date {date} "
-                        f"(new: {new_unique})"
-                    )
-                    return new_unique
-                except Exception as e:
-                    print(f"    WARN: Failed to parse schedule response: {e}")
-                    return 0
-
-            async def collect_schedule_after_action(
-                action, first_timeout_ms: int, followup_timeout_ms: int = 800
-            ) -> tuple[int, bool]:
-                total_added = 0
-                try:
-                    async with page.expect_response(
-                        is_schedule_response, timeout=first_timeout_ms
-                    ) as first_resp_info:
-                        await action()
-                    first_resp = await first_resp_info.value
-                    total_added += await append_from_response(first_resp)
-                except PlaywrightTimeoutError:
-                    return 0, False
-
-                # Collect trailing schedule responses emitted by the same UI action.
-                while True:
-                    try:
-                        resp = await page.wait_for_event(
-                            "response",
-                            predicate=is_schedule_response,
-                            timeout=followup_timeout_ms,
-                        )
-                    except PlaywrightTimeoutError:
-                        break
-                    total_added += await append_from_response(resp)
-                return total_added, True
-
-            async def is_date_span_disabled(span) -> bool:
-                try:
-                    return await span.evaluate(
-                        """el => {
-                        const parent = el.parentElement;
-                        if (!parent) return false;
-                        if (parent.disabled || parent.hasAttribute('disabled')) return true;
-                        const classes = parent.className || '';
-                        if (classes.includes('disabled') || classes.includes('inactive')) return true;
-                        const style = getComputedStyle(parent);
-                        if (style.pointerEvents === 'none') return true;
-                        return false;
-                    }"""
-                    )
-                except Exception:
-                    return True
-
-            async def attach_page_hooks(target_page):
-                if route_handler is not None:
-                    await target_page.route("**/*", route_handler)
-
-            if bandwidth_saver:
-                print("  Bandwidth saver ON (fonts + trackers + images)")
-            await attach_page_hooks(page)
-
-            url = "https://cgv.co.kr/cnm/movieBook/cinema"
-            goto_attempts = ((1, 12000), (2, 18000))
-            for attempt, timeout_ms in goto_attempts:
-                try:
-                    print(f"  Navigating to CGV cinema page... (attempt {attempt}/2)")
-                    await page.goto(
-                        url,
-                        wait_until="domcontentloaded",
-                        timeout=timeout_ms,
-                    )
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        raise
-                    print(f"  WARN: page.goto retrying after error: {e}")
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                    page = await context.new_page()
-                    await attach_page_hooks(page)
-                    await asyncio.sleep(0.5)
-            modal_selector = await self._wait_for_theater_modal(page)
-            print(f"  Clicking on theater: {theater_name_for_click}")
-            print(f"  Waiting for initial data to load...")
-            async def click_theater():
-                await page.locator(modal_selector).first.locator(
-                    f'text="{theater_name_for_click}"'
-                ).click()
-
-            _, initial_load_success = await collect_schedule_after_action(
-                click_theater, first_timeout_ms=15000
-            )
-            if not initial_load_success:
-                print(f"  WARNING: Initial data load timed out!")
-
-            print(f"  Initial data loaded: {len(theater_data)} screenings")
-
-            # Find all available date navigation elements for this specific theater
-            try:
-                # Get fresh date elements each time to avoid stale references
-                date_spans = await page.query_selector_all(
-                    "span.dayScroll_number__o8i9s"
-                )
-                print(f"  Found {len(date_spans)} total date elements for {theater.name}")
-
-                if len(date_spans) == 0:
-                    print(f"  WARNING: No date navigation elements found!")
-                else:
-                    # Track enabled/disabled state per visible date label.
-                    # If the same label appears multiple times (carousel clones/month boundary),
-                    # treat it as enabled when ANY instance is clickable.
-                    date_states: dict[str, dict[str, bool]] = {}
-                    ordered_dates: list[str] = []
-
-                    for span in date_spans:
-                        try:
-                            date_text = (await span.inner_text()).strip()
-                            if not date_text:
-                                continue
-                            is_disabled = await is_date_span_disabled(span)
-
-                            if date_text not in date_states:
-                                date_states[date_text] = {
-                                    "enabled": False,
-                                    "disabled": False,
-                                }
-                                ordered_dates.append(date_text)
-
-                            if is_disabled:
-                                date_states[date_text]["disabled"] = True
-                            else:
-                                date_states[date_text]["enabled"] = True
-                        except Exception:
-                            continue
-
-                    available_dates = [
-                        d for d in ordered_dates if date_states[d]["enabled"]
-                    ]
-                    disabled_only_dates = sorted(
-                        [
-                            d
-                            for d in ordered_dates
-                            if date_states[d]["disabled"] and not date_states[d]["enabled"]
-                        ]
-                    )
-
-                    print(f"  Enabled dates: {available_dates}")
-                    if disabled_only_dates:
-                        print(f"  Disabled dates (skipped): {disabled_only_dates}")
-
-                    # Skip only the ACTUAL initially loaded date, not blindly available_dates[0].
-                    loaded_date_label = None
-                    if theater_data:
-                        loaded_scn_ymd = str(theater_data[0].get("scnYmd") or "").strip()
-                        if len(loaded_scn_ymd) == 8 and loaded_scn_ymd.isdigit():
-                            loaded_date_label = loaded_scn_ymd[6:]
-
-                    dates_to_click = []
-                    loaded_date_skipped = False
-                    for date_label in available_dates:
-                        if (
-                            not loaded_date_skipped
-                            and loaded_date_label is not None
-                            and date_label == loaded_date_label
-                        ):
-                            loaded_date_skipped = True
-                            continue
-                        dates_to_click.append(date_label)
-
-                    if loaded_date_label:
-                        if loaded_date_skipped:
-                            print(
-                                f"  Skipping loaded date '{loaded_date_label}'"
-                            )
-                        else:
-                            print(
-                                f"  Loaded date '{loaded_date_label}' not found among enabled dates"
-                            )
-                    print(
-                        f"  Will click remaining {len(dates_to_click)} dates: {dates_to_click}"
-                    )
-
-                    # Click through remaining available dates using fresh queries
-                    for j, target_date in enumerate(dates_to_click):
-                        try:
-                            print(
-                                f"    [{j+1}/{len(dates_to_click)}] Clicking on date: {target_date}"
-                            )
-
-                            # Re-query to get a fresh element reference
-                            fresh_date_spans = await page.query_selector_all(
-                                "span.dayScroll_number__o8i9s"
-                            )
-                            target_span = None
-
-                            for span in fresh_date_spans:
-                                try:
-                                    span_text = await span.inner_text()
-                                    if (
-                                        span_text == target_date
-                                        and not await is_date_span_disabled(span)
-                                    ):
-                                        target_span = span
-                                        break
-                                except:
-                                    continue
-
-                            if not target_span:
-                                print(
-                                    f"    ✗ Could not find date {target_date} on current page"
-                                )
-                                continue
-
-                            initial_count = len(theater_data)
-                            async def click_date():
-                                await target_span.click(timeout=3000)
-
-                            added_count, load_success = await collect_schedule_after_action(
-                                click_date, first_timeout_ms=8000
-                            )
-                            new_count = len(theater_data)
-
-                            if load_success and added_count > 0:
-                                print(
-                                    f"    ✓ Added {added_count} new screenings (Total: {new_count})"
-                                )
-                            elif load_success and added_count == 0:
-                                print(
-                                    f"    ⚠ Date {target_date} loaded but no new screenings (Total: {new_count})"
-                                )
-                            else:
-                                print(
-                                    f"    ✗ Timeout waiting for date {target_date} (Total: {new_count})"
-                                )
-
-                        except Exception as e:
-                            print(f"    ✗ Failed to click date {target_date}: {e}")
-                            continue
-
-            except Exception as e:
-                print(f"  Error finding date elements: {e}")
-
-            # Process all collected screening data
-            print(f"  Total screenings collected: {len(theater_data)}")
-            for screening_data in theater_data:
-                is_core_art = screening_data.get("sascnsGradNm") == "아트하우스"
-                movie_url = (
-                    f'https://cgv.co.kr/cnm/movieBook/movie?'
-                    f'movNo={screening_data["movNo"]}&'
-                    f'scnYmd={screening_data["scnYmd"]}&'
-                    f'siteNo={screening_data["siteNo"]}&'
-                    f'siteNm={theater_name_for_click}&'
-                    f'scnsNo={screening_data["scnsNo"]}&'
-                    f'scnSseq={screening_data["scnSseq"]}'
-                )
-
-                screenings.append(
-                    Screening(
-                        provider=self.chain,
-                        cinema_name=theater.name,
-                        # Use the selected theater code as canonical key.
-                        # CGV payload `siteNo` can vary (e.g., P013/P001) and break cinemas joins.
-                        cinema_code=theater.cinema_code,
-                        screen_name=screening_data["scnsNm"],
-                        movie_title=screening_data["movNm"],
-                        movie_title_en=(screening_data.get("movEnm") or "").strip() or None,
-                        source_movie_code=str(
-                            screening_data.get("movNo") or ""
-                        ).strip() or None,
-                        is_core_art_screen=is_core_art,
-                        start_dt=f'{screening_data["scnsrtTm"][:2]}:{screening_data["scnsrtTm"][2:]}',
-                        end_dt=f'{screening_data["scnendTm"][:2]}:{screening_data["scnendTm"][2:]}',
-                        play_date=f'{screening_data["scnYmd"][:4]}-{screening_data["scnYmd"][4:6]}-{screening_data["scnYmd"][6:]}',
-                        crawl_ts=crawl_ts.isoformat(),
-                        url=movie_url,
-                        remain_seat_cnt=int(screening_data["frSeatCnt"]),
-                        total_seat_cnt=int(screening_data["stcnt"]),
-                    )
-                )
-
-            print(f"  Completed theater {theater.name}")
-            if bandwidth_saver:
+            jobs: list[tuple[Cinema, str]] = []
+            cutoff = start_date.strftime("%Y%m%d") if start_date else None
+            for theater, dates in zip(self.theaters, date_lists):
+                if not dates:
+                    print(f"  {theater.name}: no operational dates (skipping)")
+                    continue
+                effective = [d for d in dates if cutoff is None or d >= cutoff]
+                if not effective:
+                    print(f"  {theater.name}: all dates before start_date (skipping)")
+                    continue
                 print(
-                    "  Bandwidth saver blocked: "
-                    f"font={blocked_counts['font']} "
-                    f"tracker={blocked_counts['tracker']} "
-                    f"image={blocked_counts['image']}"
+                    f"  {theater.name}: {len(effective)} dates "
+                    f"({effective[0]}…{effective[-1]})"
                 )
+                for d in effective:
+                    jobs.append((theater, d))
 
-        except CGVAccessBlockedError:
-            raise
-        except Exception as e:
-            print(f"  ERROR processing theater {theater.name}: {e}")
-            await self._dump_debug_artifacts(page, theater.cinema_code)
-        finally:
-            # Always close the context
-            await context.close()
+            if not jobs:
+                return []
+
+            print(f"  Fetching schedules for {len(jobs)} (theater × date) pairs...")
+            payloads = await asyncio.gather(
+                *[
+                    self._fetch_screenings(session, t.cinema_code, d, sem, limiter)
+                    for t, d in jobs
+                ]
+            )
+
+        seen: set[tuple] = set()
+        per_theater: dict[str, int] = {}
+        for (theater, _), items in zip(jobs, payloads):
+            for item in items:
+                key = (
+                    item.get("siteNo"),
+                    item.get("movNo"),
+                    item.get("scnYmd"),
+                    item.get("scnsNo"),
+                    item.get("scnSseq"),
+                    item.get("scnsrtTm"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    screenings.append(self._to_screening(theater, item, crawl_ts))
+                    per_theater[theater.name] = per_theater.get(theater.name, 0) + 1
+                except Exception as e:
+                    print(f"  ⚠ skip malformed item ({theater.name}): {e}")
+
+        for name, n in per_theater.items():
+            print(f"  {name}: {n} screenings")
         return screenings
 
     async def iter(self, date: dt.date) -> Iterable[Screening]:
-        """A-sync generator yielding Screening objects"""
-        # This method is no longer used by the CGV crawler's run method
-        # but is kept for compatibility with the BaseCrawler interface.
-        yield
-        return
+        """Required by BaseCrawler ABC; CGV uses its own run() implementation."""
+        if False:
+            yield  # type: ignore[unreachable]

@@ -2,4 +2,5 @@ pydantic==2.11.5
 playwright==1.48.0
 supabase==2.15.2
 httpx==0.28.1
+curl_cffi==0.15.0
 awslambdaric
