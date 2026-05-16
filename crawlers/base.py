@@ -1,7 +1,5 @@
 import abc
-import json
 import logging
-from pathlib import Path
 from typing import List, get_args
 
 from models import Chain, Cinema, Screening
@@ -22,26 +20,17 @@ class BaseCrawler(abc.ABC):
         self.theaters: List[Cinema] = self.load_theaters()
 
     def load_theaters(self) -> list[Cinema]:
+        """Load theaters for `self.chain` from Supabase (the authoritative source).
+
+        Live DB read means new cinemas added via `crawlers.sync_cinemas` are
+        picked up on the next crawl invocation with no redeploy needed.
         """
-        Load theaters from local JSON or fallback to Supabase.
-        Filters by `self.chain`.
-        """
-        try:
-            root_dir = Path(__file__).parent.parent
-            json_path = root_dir / "cinemas.json"
-            if json_path.exists():
-                with open(json_path, encoding="utf-8") as fp:
-                    data = [Cinema(**c) for c in json.load(fp) if c["chain"] == self.chain]
-                logger.info("Loaded %d %s theaters from %s", len(data), self.chain, json_path)
-                return data
-            elif self.supabase:
-                raw = self.supabase.fetch_cinemas(chain=self.chain)
-                data = [Cinema(**c) for c in raw]
-                logger.info("Loaded %d %s theaters from Supabase", len(data), self.chain)
-                return data
-        except Exception as exc:
-            logger.error("Error loading theaters: %s", exc)
-        return []
+        if self.supabase is None:
+            raise RuntimeError("BaseCrawler requires a SupabaseClient to load theaters")
+        raw = self.supabase.fetch_cinemas(chain=self.chain)
+        data = [Cinema(**c) for c in raw]
+        logger.info("Loaded %d %s theaters from Supabase", len(data), self.chain)
+        return data
 
     async def save_to_db(self, screenings: List) -> None:
         if not screenings:

@@ -17,7 +17,6 @@ RUN pip install --no-cache-dir --target ${FUNCTION_DIR} -r requirements-crawler.
 # Copy application code
 COPY crawlers/ ${FUNCTION_DIR}/crawlers/
 COPY models.py ${FUNCTION_DIR}/models.py
-COPY cinemas.json ${FUNCTION_DIR}/cinemas.json
 
 # Multi-stage build: grab a fresh copy of the base image
 FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy AS crawler
