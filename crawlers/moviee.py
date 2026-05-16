@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import asyncio
 import datetime as dt
 import re
 from typing import Iterable
@@ -5,23 +8,28 @@ from typing import Iterable
 import httpx
 
 from crawlers.base import BaseCrawler
-from models import Chain, Screening
+from models import Cinema, Chain, Screening
+
+
+_BASE = "https://moviee.co.kr"
+_DATES_URL = f"{_BASE}/api/TicketApi/GetPlayDateList"
+_TIMES_URL = f"{_BASE}/api/TicketApi/GetPlayTimeList"
+_PROVIDER_ID = "Y24"
+_HEADERS = {
+    "X-Requested-With": "XMLHttpRequest",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
 
 
 class MovieeCrawler(BaseCrawler):
     chain: Chain = "Moviee"
 
-    _base_url = "https://moviee.co.kr"
-    _play_date_url = f"{_base_url}/api/TicketApi/GetPlayDateList"
-    _play_time_url = f"{_base_url}/api/TicketApi/GetPlayTimeList"
-    _provider_id = "Y24"
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._play_dates_cache: dict[str, set[str]] = {}
-
     @staticmethod
-    def _to_hhmm(value: str | int | None) -> str | None:
+    def _to_hhmm(value) -> str | None:
         if value is None:
             return None
         digits = re.sub(r"\D", "", str(value))
@@ -43,125 +51,153 @@ class MovieeCrawler(BaseCrawler):
         except ValueError:
             return None
 
-    async def _get_available_dates(self, client: httpx.AsyncClient, theater_code: str) -> set[str]:
-        if theater_code in self._play_dates_cache:
-            return self._play_dates_cache[theater_code]
-
+    async def _fetch_dates(
+        self,
+        client: httpx.AsyncClient,
+        sem: asyncio.Semaphore,
+        theater: Cinema,
+    ) -> list[str]:
         params = {
-            "tIdList": theater_code,
+            "tIdList": theater.cinema_code,
             "mId": "",
             "groupCd": -1,
             "mode": 0,
             "gId": "",
-            "pId": self._provider_id,
+            "pId": _PROVIDER_ID,
         }
-        try:
-            response = await client.get(self._play_date_url, params=params)
-            response.raise_for_status()
-            payload = response.json()
-        except Exception as exc:
-            print(f"[Moviee:{theater_code}] GetPlayDateList failed: {exc}")
-            self._play_dates_cache[theater_code] = set()
-            return set()
-
+        async with sem:
+            try:
+                resp = await client.get(_DATES_URL, params=params)
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as e:
+                print(f"  ⚠ dates fetch failed for {theater.name}: {e}")
+                return []
         if payload.get("ResCd") != "00":
-            print(
-                f"[Moviee:{theater_code}] GetPlayDateList returned ResCd={payload.get('ResCd')}"
-            )
-            self._play_dates_cache[theater_code] = set()
-            return set()
-
+            print(f"  ⚠ {theater.name} GetPlayDateList ResCd={payload.get('ResCd')}")
+            return []
         table = ((payload.get("ResData") or {}).get("Table") or [])
-        dates = {
+        return [
             (row.get("PLAY_DT") or "").strip()
             for row in table
             if isinstance(row, dict) and (row.get("PLAY_DT") or "").strip()
+        ]
+
+    async def _fetch_screenings(
+        self,
+        client: httpx.AsyncClient,
+        sem: asyncio.Semaphore,
+        theater: Cinema,
+        play_date: str,
+    ) -> list[dict]:
+        params = {
+            "tId": theater.cinema_code,
+            "mId": "",
+            "playDt": play_date,
+            "ntId": "",
+            "gId": "",
         }
-        self._play_dates_cache[theater_code] = dates
-        return dates
+        async with sem:
+            try:
+                resp = await client.get(_TIMES_URL, params=params)
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as e:
+                print(f"  ⚠ schedule fetch failed for {theater.name} date={play_date}: {e}")
+                return []
+        if payload.get("ResCd") != "00":
+            print(f"  ⚠ {theater.name} GetPlayTimeList ResCd={payload.get('ResCd')}")
+            return []
+        return ((payload.get("ResData") or {}).get("Table") or [])
+
+    def _to_screening(
+        self, theater: Cinema, item: dict, target_date: str, crawl_ts: str
+    ) -> Screening | None:
+        movie_title = (item.get("M_NM") or "").strip()
+        if not movie_title:
+            return None
+        start_dt = self._to_hhmm(item.get("PLAY_TIME"))
+        end_dt = self._to_hhmm(item.get("END_TIME"))
+        if not start_dt or not end_dt:
+            return None
+
+        play_date = (item.get("PLAY_DT") or target_date).strip() or target_date
+        cinema_name = (item.get("T_NM") or theater.name).strip()
+        cinema_code = str(item.get("T_ID") or theater.cinema_code)
+        screen_name = (item.get("TS_NM") or "").strip() or "미지정"
+
+        movie_id = (item.get("M_ID") or "").strip()
+        ts_id = (item.get("TS_ID") or "").strip()
+        pno = item.get("PNO")
+        play_date_compact = play_date.replace("-", "")
+        booking_url = None
+        if movie_id and cinema_code and ts_id and pno not in (None, ""):
+            booking_url = (
+                f"{_BASE}/Movie/Ticket"
+                f"?gId=&mId={movie_id}&tId={cinema_code}"
+                f"&playDate={play_date_compact}&pno={pno}&tsid={ts_id}"
+            )
+
+        return Screening(
+            provider=self.chain,
+            cinema_name=cinema_name,
+            cinema_code=cinema_code,
+            screen_name=screen_name,
+            movie_title=movie_title,
+            source_movie_code=movie_id or None,
+            is_core_art_screen=True,
+            play_date=play_date,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            crawl_ts=crawl_ts,
+            url=booking_url,
+            remain_seat_cnt=self._to_int(item.get("REMAINSEAT_CNT")),
+            total_seat_cnt=self._to_int(item.get("SEAT_CNT")),
+        )
+
+    async def run(
+        self, start_date: dt.date | None = None, max_days: int | None = None
+    ) -> list[Screening]:
+        # max_days intentionally ignored: GetPlayDateList returns the exact dates
+        # each theater operates on.
+        screenings: list[Screening] = []
+        crawl_ts = dt.datetime.utcnow().isoformat()
+        cutoff = start_date.isoformat() if start_date else None
+
+        sem = asyncio.Semaphore(8)
+        async with httpx.AsyncClient(timeout=10.0, headers=_HEADERS) as client:
+            print(f"  Fetching operational dates for {len(self.theaters)} theaters...")
+            date_lists = await asyncio.gather(*[
+                self._fetch_dates(client, sem, t) for t in self.theaters
+            ])
+
+            jobs: list[tuple[Cinema, str]] = []
+            for theater, dates in zip(self.theaters, date_lists):
+                effective = [d for d in dates if cutoff is None or d >= cutoff]
+                print(
+                    f"  {theater.name}: {len(dates)} operational dates "
+                    f"({len(effective)} after start_date filter)"
+                )
+                for d in effective:
+                    jobs.append((theater, d))
+
+            if jobs:
+                print(f"  Fetching schedules for {len(jobs)} (theater × date) pairs...")
+                payloads = await asyncio.gather(*[
+                    self._fetch_screenings(client, sem, t, d) for t, d in jobs
+                ])
+                for (theater, play_date), items in zip(jobs, payloads):
+                    for item in items:
+                        try:
+                            s = self._to_screening(theater, item, play_date, crawl_ts)
+                            if s is not None:
+                                screenings.append(s)
+                        except Exception as e:
+                            print(f"  ⚠ skip malformed item ({theater.name}): {e}")
+
+        return screenings
 
     async def iter(self, date: dt.date) -> Iterable[Screening]:
-        target_date = date.isoformat()
-        crawl_ts = dt.datetime.utcnow().isoformat()
-
-        headers = {
-            "X-Requested-With": "XMLHttpRequest",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        }
-
-        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-            for theater in self.theaters:
-                theater_code = str(theater.cinema_code)
-                available_dates = await self._get_available_dates(client, theater_code)
-                if available_dates and target_date not in available_dates:
-                    continue
-
-                params = {
-                    "tId": theater_code,
-                    "mId": "",
-                    "playDt": target_date,
-                    "ntId": "",
-                    "gId": "",
-                }
-                try:
-                    response = await client.get(self._play_time_url, params=params)
-                    response.raise_for_status()
-                    payload = response.json()
-                except Exception as exc:
-                    print(f"[Moviee:{theater_code}] GetPlayTimeList failed: {exc}")
-                    continue
-
-                if payload.get("ResCd") != "00":
-                    print(
-                        f"[Moviee:{theater_code}] GetPlayTimeList returned ResCd={payload.get('ResCd')}"
-                    )
-                    continue
-
-                rows = ((payload.get("ResData") or {}).get("Table") or [])
-                for item in rows:
-                    movie_title = (item.get("M_NM") or "").strip()
-                    if not movie_title:
-                        continue
-
-                    start_dt = self._to_hhmm(item.get("PLAY_TIME"))
-                    end_dt = self._to_hhmm(item.get("END_TIME"))
-                    if not start_dt or not end_dt:
-                        continue
-
-                    play_date = (item.get("PLAY_DT") or target_date).strip() or target_date
-                    cinema_name = (item.get("T_NM") or theater.name).strip()
-                    cinema_code = str(item.get("T_ID") or theater_code)
-                    screen_name = (item.get("TS_NM") or "").strip() or "미지정"
-
-                    movie_id = (item.get("M_ID") or "").strip()
-                    ts_id = (item.get("TS_ID") or "").strip()
-                    pno = item.get("PNO")
-                    play_date_compact = play_date.replace("-", "")
-                    booking_url = None
-                    if movie_id and cinema_code and ts_id and pno not in (None, ""):
-                        booking_url = (
-                            f"{self._base_url}/Movie/Ticket"
-                            f"?gId=&mId={movie_id}&tId={cinema_code}"
-                            f"&playDate={play_date_compact}&pno={pno}&tsid={ts_id}"
-                        )
-
-                    yield Screening(
-                        provider=self.chain,
-                        cinema_name=cinema_name,
-                        cinema_code=cinema_code,
-                        screen_name=screen_name,
-                        movie_title=movie_title,
-                        source_movie_code=movie_id or None,
-                        is_core_art_screen=True,
-                        play_date=play_date,
-                        start_dt=start_dt,
-                        end_dt=end_dt,
-                        crawl_ts=crawl_ts,
-                        url=booking_url,
-                        remain_seat_cnt=self._to_int(item.get("REMAINSEAT_CNT")),
-                        total_seat_cnt=self._to_int(item.get("SEAT_CNT")),
-                    )
+        """Required by BaseCrawler ABC; Moviee uses its own run() implementation."""
+        if False:
+            yield  # type: ignore[unreachable]
