@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
-from typing import Iterable
 
 import httpx
 
@@ -128,14 +127,11 @@ class LotteCinemaCrawler(BaseCrawler):
             total_seat_cnt=int(item["TotalSeatCount"]),
         )
 
-    async def run(
-        self, start_date: dt.date | None = None, max_days: int | None = None
-    ) -> list[Screening]:
-        # max_days intentionally ignored: GetInvisibleMoviePlayInfo returns the
-        # exact list of dates this theater operates on.
+    async def run(self) -> list[Screening]:
+        # GetInvisibleMoviePlayInfo returns the exact list of dates each theater
+        # operates on.
         screenings: list[Screening] = []
         crawl_ts = dt.datetime.utcnow()
-        cutoff = start_date.strftime("%Y-%m-%d") if start_date else None
 
         sem = asyncio.Semaphore(8)
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -146,12 +142,8 @@ class LotteCinemaCrawler(BaseCrawler):
 
             jobs: list[tuple[Cinema, str]] = []
             for theater, dates in zip(self.theaters, date_lists):
-                effective = [d for d in dates if cutoff is None or d >= cutoff]
-                print(
-                    f"  {theater.name}: {len(dates)} operational dates "
-                    f"({len(effective)} after start_date filter)"
-                )
-                for d in effective:
+                print(f"  {theater.name}: {len(dates)} operational dates")
+                for d in dates:
                     jobs.append((theater, d))
 
             if jobs:
@@ -170,7 +162,3 @@ class LotteCinemaCrawler(BaseCrawler):
 
         return screenings
 
-    async def iter(self, date: dt.date) -> Iterable[Screening]:
-        """Required by BaseCrawler ABC; Lotte uses its own run() implementation."""
-        if False:
-            yield  # type: ignore[unreachable]

@@ -10,7 +10,6 @@ import hmac
 import os
 import random
 import time
-from typing import Iterable
 
 import httpx
 from curl_cffi.requests import AsyncSession
@@ -203,11 +202,8 @@ class CGVCrawler(BaseCrawler):
             total_seat_cnt=int(item["stcnt"]),
         )
 
-    async def run(
-        self, start_date: dt.date | None = None, max_days: int | None = None
-    ) -> list[Screening]:
-        # max_days is intentionally ignored: the dates endpoint tells us exactly
-        # which days CGV has booking open. start_date acts as a lower-bound filter only.
+    async def run(self) -> list[Screening]:
+        # The dates endpoint tells us exactly which days CGV has booking open.
         screenings: list[Screening] = []
         crawl_ts = dt.datetime.utcnow()
 
@@ -252,20 +248,15 @@ class CGVCrawler(BaseCrawler):
             ])
 
             jobs: list[tuple[Cinema, str]] = []
-            cutoff = start_date.strftime("%Y%m%d") if start_date else None
             for theater, dates in zip(self.theaters, date_lists):
                 if not dates:
                     print(f"  {theater.name}: no operational dates (skipping)")
                     continue
-                effective = [d for d in dates if cutoff is None or d >= cutoff]
-                if not effective:
-                    print(f"  {theater.name}: all dates before start_date (skipping)")
-                    continue
                 print(
-                    f"  {theater.name}: {len(effective)} dates "
-                    f"({effective[0]}…{effective[-1]})"
+                    f"  {theater.name}: {len(dates)} dates "
+                    f"({dates[0]}…{dates[-1]})"
                 )
-                for d in effective:
+                for d in dates:
                     jobs.append((theater, d))
 
             if not jobs:
@@ -302,7 +293,3 @@ class CGVCrawler(BaseCrawler):
             print(f"  {name}: {n} screenings")
         return screenings
 
-    async def iter(self, date: dt.date) -> Iterable[Screening]:
-        """Required by BaseCrawler ABC; CGV uses its own run() implementation."""
-        if False:
-            yield  # type: ignore[unreachable]

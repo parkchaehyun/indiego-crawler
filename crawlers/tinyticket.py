@@ -2,7 +2,7 @@
 
 import re
 import datetime
-from typing import Generator
+from typing import List
 
 from playwright.async_api import async_playwright
 
@@ -14,21 +14,12 @@ class TinyTicketCrawler(BaseCrawler):
     chain: Chain = "TinyTicket"
     base_url = "https://www.tinyticket.net/event-manager"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    async def run(self) -> List[Screening]:
+        """TinyTicket renders all bookable dates on the event-manager page in
+        one go, so we scrape them in a single Playwright session per theater."""
+        results: List[Screening] = []
+        crawl_ts = datetime.datetime.utcnow().isoformat()
 
-    async def run(
-            self,
-            start_date: datetime.date | None = None,
-            max_days: int | None = None
-    ) -> list[Screening]:
-        """
-        TinyTicketCrawler.iter() already grabs all dates at once,
-        so override run() to call iter() a single time.
-        """
-        return [s async for s in self.iter(start_date)]
-
-    async def iter(self, date: datetime.date) -> Generator[Screening, None, None]:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
@@ -64,7 +55,6 @@ class TinyTicketCrawler(BaseCrawler):
                 ]
             )
             page = await browser.new_page()
-            # Set Korean locale and language
             await page.set_extra_http_headers({
                 'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8'
             })
@@ -74,15 +64,14 @@ class TinyTicketCrawler(BaseCrawler):
             for theater in self.theaters:
                 url = f"{self.base_url}/{theater.cinema_code}"
                 print(f"Processing TinyTicket theater: {theater.name}")
-                
+
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=60000)
                     await page.wait_for_selector(".dateLabel", timeout=30000)
 
                     date_elements = await page.locator(".dateLabel").all()
                     for date_element in date_elements:
-                        date_raw = await date_element.inner_text()
-                        date_raw = date_raw.strip()
+                        date_raw = (await date_element.inner_text()).strip()
                         m = re.match(r"(\d{2})/(\d{2})", date_raw)
                         if not m:
                             continue
@@ -98,27 +87,19 @@ class TinyTicketCrawler(BaseCrawler):
                                 if await box.count() == 0:
                                     continue
 
-                                # Get movie title from the first span.nobreak (after radio_button_checked)
                                 title_spans = box.locator(".nameBox span.nobreak")
                                 span_count = await title_spans.count()
-                                if span_count < 1:
-                                    continue
-                                
-                                title_element = title_spans.nth(0)  # First span contains title
-                                title_text = await title_element.inner_text()
-                                title = title_text.replace("radio_button_checked", "").strip()
-
-                                # Get time from the second span.nobreak (schedule info)  
                                 if span_count < 2:
                                     continue
-                                time_element = title_spans.nth(1)  # Second span contains time
-                                times_raw = await time_element.inner_text()
-                                times_raw = times_raw.replace("schedule", "").strip()
+
+                                title_text = await title_spans.nth(0).inner_text()
+                                title = title_text.replace("radio_button_checked", "").strip()
+
+                                times_raw = (await title_spans.nth(1).inner_text()).replace("schedule", "").strip()
                                 if not times_raw or "-" not in times_raw:
                                     continue
                                 start_str, end_str = times_raw.split("-", 1)
 
-                                # Get seats from .salingInfo
                                 rem_el = box.locator(".salingInfo")
                                 if await rem_el.count():
                                     raw_text = await rem_el.inner_text()
@@ -132,12 +113,7 @@ class TinyTicketCrawler(BaseCrawler):
                                 else:
                                     remaining = total = None
 
-                                # Get venue
-                                venue_element = box.locator(".venue")
-                                venue = await venue_element.inner_text() if await venue_element.count() else ""
-                                venue = venue.strip()
-
-                                yield Screening(
+                                results.append(Screening(
                                     provider=self.chain,
                                     cinema_code=theater.cinema_code,
                                     cinema_name=theater.name,
@@ -150,15 +126,17 @@ class TinyTicketCrawler(BaseCrawler):
                                     url=url,
                                     remain_seat_cnt=remaining,
                                     total_seat_cnt=total,
-                                    crawl_ts=datetime.datetime.utcnow().isoformat(),
-                                )
-                                    
+                                    crawl_ts=crawl_ts,
+                                ))
+
                             except Exception as e:
                                 print(f"Error processing card in {theater.name}: {e}")
                                 continue
-                                
+
                 except Exception as e:
                     print(f"Error processing theater {theater.name}: {e}")
                     continue
 
             await browser.close()
+
+        return results

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import re
-from typing import Iterable
 
 import httpx
 
@@ -155,14 +154,10 @@ class MovieeCrawler(BaseCrawler):
             total_seat_cnt=self._to_int(item.get("SEAT_CNT")),
         )
 
-    async def run(
-        self, start_date: dt.date | None = None, max_days: int | None = None
-    ) -> list[Screening]:
-        # max_days intentionally ignored: GetPlayDateList returns the exact dates
-        # each theater operates on.
+    async def run(self) -> list[Screening]:
+        # GetPlayDateList returns the exact dates each theater operates on.
         screenings: list[Screening] = []
         crawl_ts = dt.datetime.utcnow().isoformat()
-        cutoff = start_date.isoformat() if start_date else None
 
         sem = asyncio.Semaphore(8)
         async with httpx.AsyncClient(timeout=10.0, headers=_HEADERS) as client:
@@ -173,12 +168,8 @@ class MovieeCrawler(BaseCrawler):
 
             jobs: list[tuple[Cinema, str]] = []
             for theater, dates in zip(self.theaters, date_lists):
-                effective = [d for d in dates if cutoff is None or d >= cutoff]
-                print(
-                    f"  {theater.name}: {len(dates)} operational dates "
-                    f"({len(effective)} after start_date filter)"
-                )
-                for d in effective:
+                print(f"  {theater.name}: {len(dates)} operational dates")
+                for d in dates:
                     jobs.append((theater, d))
 
             if jobs:
@@ -197,7 +188,3 @@ class MovieeCrawler(BaseCrawler):
 
         return screenings
 
-    async def iter(self, date: dt.date) -> Iterable[Screening]:
-        """Required by BaseCrawler ABC; Moviee uses its own run() implementation."""
-        if False:
-            yield  # type: ignore[unreachable]

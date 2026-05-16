@@ -2,9 +2,9 @@ import abc
 import json
 import logging
 from pathlib import Path
-from typing import Iterable, List, get_args
-import datetime as dt
-from models import Screening, Chain, Cinema
+from typing import List, get_args
+
+from models import Chain, Cinema, Screening
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,26 +53,11 @@ class BaseCrawler(abc.ABC):
             print(f"❌ Supabase save error for {self.chain}: {exc}")
             raise
 
-    async def run(
-            self,
-            start_date: dt.date | None = None,
-            max_days: int | None = None
-    ) -> list[Screening]:
-        start = start_date or dt.date.today()
-        collected: list[Screening] = []
-
-        day_offset = 0
-        while max_days is None or day_offset < max_days:
-            target_date = start + dt.timedelta(days=day_offset)
-            day_screenings = [s async for s in self.iter(target_date)]
-
-            if day_screenings:
-                collected.extend(day_screenings)
-
-            day_offset += 1
-
-        return collected
-
     @abc.abstractmethod
-    async def iter(self, date: dt.date) -> Iterable[Screening]:
-        """A-sync generator yielding Screening objects"""
+    async def run(self) -> list[Screening]:
+        """Return every bookable screening this chain currently exposes.
+
+        Each crawler discovers the operational date list per theater from the
+        chain's own API rather than iterating a fixed window.
+        """
+        ...

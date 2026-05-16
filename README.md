@@ -41,7 +41,8 @@ Key runtime facts:
 - TMDB image is lightweight (`public.ecr.aws/lambda/python:3.11`).
 - Default crawler event:
   - `chains`: `["CGV", "Megabox", "Lotte", "TinyTicket", "Dtryx", "Moviee", "KOFA"]`
-  - `max_days`: `14`
+- Each crawler discovers its own operational date list from the chain's API,
+  so there is no fixed-window parameter — every bookable screening is fetched.
 
 ---
 
@@ -74,9 +75,9 @@ Required:
 
 Crawler optional:
 - `KOFA_SERVICE_KEY` (required for KOFA data)
+- `CGV_SIGN_SECRET` (required for CGV; HMAC secret extracted from CGV's JS bundle)
 - `WEBSHARE_API_KEY` (optional proxy pool for CGV)
-- `CGV_HEADLESS` (`1` default, set `0` for headed local debug)
-- `CGV_BANDWIDTH_SAVER` (`0` default, set `1` to block images/fonts/trackers)
+- `CGV_PROXY_COUNT` (number of parallel proxies, default `4`)
 
 TMDB updater required:
 - `TMDB_API_KEY` (TMDB v4 Bearer token)
@@ -173,17 +174,17 @@ docker buildx build \
 ### Run a single chain quickly
 
 ```bash
-PYTHONPATH=. ./.venv/bin/python -m crawlers.offline_test
+PYTHONPATH=. python -m crawlers.offline_test --chain Megabox
 ```
 
-Edit `CHAIN = "..."` in `crawlers/offline_test.py`.
+Writes the result to `megabox_screenings_local.json`. Pass `--output PATH` to override.
 
 ### Invoke Lambda handler locally
 
 ```bash
 python - <<'PY'
 from crawlers.lambda_function import lambda_handler
-print(lambda_handler({"chains":["CGV"],"max_days":14}, None))
+print(lambda_handler({"chains":["CGV"]}, None))
 PY
 ```
 
@@ -191,7 +192,7 @@ PY
 
 ## Notes
 
-- CGV anti-bot behavior can vary by environment/IP. Proxy and bandwidth-saver flags are CGV-specific knobs.
+- CGV anti-bot behavior can vary by environment/IP. The Webshare proxy pool is a CGV-specific knob (`WEBSHARE_API_KEY`, `CGV_PROXY_COUNT`).
 - Poster updater now focuses on upcoming movies via `upcoming_movie_ids`, not all historical movies.
 
 ---

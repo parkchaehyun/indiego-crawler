@@ -1,29 +1,25 @@
 # crawlers/kofa.py
 
-import datetime as dt
 import calendar
+import datetime as dt
 import os
-from typing import Optional, AsyncIterator
 
 import httpx
 
 from crawlers.base import BaseCrawler
-from models import Screening, Chain
+from models import Chain, Screening
 
 
 class KOFACrawler(BaseCrawler):
     chain: Chain = "KOFA"
     api_url = "https://www.kmdb.or.kr/info/api/3/api.json"
     service_key = os.getenv("KOFA_SERVICE_KEY")
-    async def run(
-        self,
-        start_date: Optional[dt.date] = None,
-        max_days: Optional[int] = None,           # now ignored
-    ) -> list[Screening]:
+
+    async def run(self) -> list[Screening]:
         """
-        Fetch all screenings from `start` through the end of the *next* calendar month.
+        Fetch all screenings from today through the end of the *next* calendar month.
         """
-        start = start_date or dt.date.today()
+        start = dt.date.today()
 
         # compute the first day of the month *after* start.month
         year, month = start.year, start.month
@@ -92,7 +88,3 @@ class KOFACrawler(BaseCrawler):
             )
 
         return results
-    async def iter(self, date: dt.date) -> AsyncIterator[Screening]:
-        # satisfy BaseCrawler’s abstract method
-        for screening in await self.run(start_date=date, max_days=1):
-            yield screening

@@ -1,5 +1,4 @@
 import asyncio
-import datetime as dt
 from crawlers.crawler_registry import CrawlerRegistry
 from crawlers.supabase_client import SupabaseClient
 
@@ -8,7 +7,6 @@ def lambda_handler(event, context):
         "chains",
         ["CGV", "Megabox", "Lotte", "TinyTicket", "Dtryx", "Moviee", "KOFA"],
     )
-    max_days = event.get("max_days", 14)
     supabase = SupabaseClient()
 
     failed = []
@@ -19,10 +17,7 @@ def lambda_handler(event, context):
             try:
                 crawler = CrawlerRegistry.get_crawler(chain, supabase)
                 print(f"▶ Running crawler for {chain}...")
-                screenings = await crawler.run(
-                    start_date=dt.date.today(),
-                    max_days=max_days
-                )
+                screenings = await crawler.run()
                 print(f"✔ {chain}: Crawled {len(screenings)} screenings")
                 await crawler.save_to_db(screenings)
                 succeeded.append(chain)

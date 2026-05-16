@@ -4,7 +4,6 @@ import asyncio
 import datetime as dt
 import html
 import re
-from typing import Iterable
 
 import httpx
 
@@ -109,20 +108,17 @@ class MegaboxCrawler(BaseCrawler):
                 print(f"  ⚠ skip malformed item ({theater.name}): {e}")
         return out
 
-    async def run(
-        self, start_date: dt.date | None = None, max_days: int | None = None
-    ) -> list[Screening]:
-        # max_days intentionally ignored: schedulePage with firstAt=Y returns the
-        # operational date list, so we crawl exactly Megabox's booking horizon.
+    async def run(self) -> list[Screening]:
+        # schedulePage with firstAt=Y returns the operational date list, so we
+        # crawl exactly Megabox's booking horizon for each theater.
         screenings: list[Screening] = []
         crawl_ts = dt.datetime.utcnow()
         today_str = dt.date.today().strftime("%Y%m%d")
-        cutoff = start_date.strftime("%Y%m%d") if start_date else None
 
         sem = asyncio.Semaphore(8)
         async with httpx.AsyncClient(timeout=15.0) as client:
             # One firstAt=Y call per theater returns both the date list AND today's
-            # screenings — reuse the latter if today falls within our crawl window.
+            # screenings — reuse the latter to save a call per theater.
             print(f"  Fetching operational dates for {len(self.theaters)} theaters...")
             first_results = await asyncio.gather(*[
                 self._fetch(client, sem, t, today_str, first=True) for t in self.theaters
@@ -138,18 +134,14 @@ class MegaboxCrawler(BaseCrawler):
                     for d in (mm.get("movieFormDeList") or [])
                     if d.get("formAt") == "Y" and d.get("playDe")
                 ]
-                effective = [d for d in operational if cutoff is None or d >= cutoff]
-                print(
-                    f"  {theater.name}: {len(operational)} operational dates "
-                    f"({len(effective)} after start_date filter)"
-                )
-                if today_str in effective:
+                print(f"  {theater.name}: {len(operational)} operational dates")
+                if today_str in operational:
                     screenings.extend(self._items_to_screenings(
                         theater, mm.get("movieFormList") or [], crawl_ts
                     ))
-                    remaining = [d for d in effective if d != today_str]
+                    remaining = [d for d in operational if d != today_str]
                 else:
-                    remaining = effective
+                    remaining = operational
                 for d in remaining:
                     jobs.append((theater, d))
 
@@ -166,7 +158,3 @@ class MegaboxCrawler(BaseCrawler):
 
         return screenings
 
-    async def iter(self, date: dt.date) -> Iterable[Screening]:
-        """Required by BaseCrawler ABC; Megabox uses its own run() implementation."""
-        if False:
-            yield  # type: ignore[unreachable]
