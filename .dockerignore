@@ -1,0 +1,32 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Local artifacts and samples
+tmp_chain_samples
+tmp_chain_samples_escalated
+*.html
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.csv
+
+# Test/debug outputs
+cgv_*_results.json
+cgv_*_test.json
+tinyticket_screenings.json
+tmdb_match_preview.py
+debug_tinyticket.py
+test_*.py
+
+# IDE/OS
+.DS_Store
+.idea
+.vscode
