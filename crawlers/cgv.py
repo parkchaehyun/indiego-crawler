@@ -42,6 +42,39 @@ def _sign(path: str, body: str = "") -> dict[str, str]:
     return {"x-timestamp": ts, "x-signature": sig}
 
 
+# Seoul = "01" in CGV's regnGrpCd taxonomy. Other regions: 02 경기, 03 인천, 04 강원, etc.
+SEOUL_REGION_CODE = "01"
+
+
+def fetch_cgv_cinema_list(region: str | None = SEOUL_REGION_CODE) -> list[dict]:
+    """Fetch CGV's theater list once (synchronous; one HTTP call, no rate limiter).
+
+    Returns: list of {'siteNo', 'siteNm', 'regnGrpCd'} dicts. Pass region=None
+    to get every region; defaults to Seoul ('01').
+
+    Premium sub-brands (씨네드쉐프 etc., site codes prefixed 'P') are returned
+    as-is — caller decides whether to skip them.
+    """
+    from curl_cffi import requests as _crequests
+    path = "/cnm/site/searchAllRegionAndSite"
+    headers = {**_BASE_HEADERS, **_sign(path)}
+    r = _crequests.get(
+        f"{_API_BASE}{path}",
+        params={"coCd": "A420"},
+        headers=headers,
+        timeout=15,
+        impersonate="chrome120",
+    )
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"CGV cinema list HTTP {r.status_code}: {r.text[:200]}"
+        )
+    sites = (r.json().get("data") or {}).get("siteInfo") or []
+    if region is not None:
+        sites = [s for s in sites if s.get("regnGrpCd") == region]
+    return sites
+
+
 class _RateLimiter:
     """Enforces a minimum interval between request starts, independent of latency.
 
