@@ -188,8 +188,13 @@ class CGVCrawler(BaseCrawler):
         except Exception as e:
             print(f"  ⚠ dates fetch failed for siteNo={site_no}: {e}")
             return []
+        # CGV occasionally returns non-dict bodies (e.g. quoted strings via a flaky
+        # proxy edge); refuse to crash the whole gather on those.
+        if not isinstance(data, dict):
+            print(f"  ⚠ dates fetch returned non-dict for siteNo={site_no}: {data!r:.200}")
+            return []
         rows = data.get("data") or []
-        return [r["scnYmd"] for r in rows if r.get("scnYmd")]
+        return [r["scnYmd"] for r in rows if isinstance(r, dict) and r.get("scnYmd")]
 
     async def _fetch_screenings(
         self, worker: _Worker, site_no: str, scn_ymd: str
@@ -203,7 +208,10 @@ class CGVCrawler(BaseCrawler):
         except Exception as e:
             print(f"  ⚠ schedule fetch failed for siteNo={site_no} date={scn_ymd}: {e}")
             return []
-        return data.get("data") or []
+        if not isinstance(data, dict):
+            print(f"  ⚠ schedule fetch returned non-dict for siteNo={site_no} date={scn_ymd}: {data!r:.200}")
+            return []
+        return [r for r in (data.get("data") or []) if isinstance(r, dict)]
 
     def _to_screening(
         self, theater: Cinema, item: dict, crawl_ts: dt.datetime
@@ -275,13 +283,19 @@ class CGVCrawler(BaseCrawler):
                 return workers[i % len(workers)]
 
             print(f"  Fetching operational dates for {len(self.theaters)} theaters...")
-            date_lists = await asyncio.gather(*[
+            # return_exceptions=True so a single unhandled error doesn't unwind the
+            # AsyncExitStack mid-flight (which closes proxy sessions and produces
+            # "Session is closed" errors in all sibling tasks).
+            date_results = await asyncio.gather(*[
                 self._fetch_dates(worker_for(i), t.cinema_code)
                 for i, t in enumerate(self.theaters)
-            ])
+            ], return_exceptions=True)
 
             jobs: list[tuple[Cinema, str]] = []
-            for theater, dates in zip(self.theaters, date_lists):
+            for theater, dates in zip(self.theaters, date_results):
+                if isinstance(dates, BaseException):
+                    print(f"  ⚠ {theater.name}: dates fetch raised {type(dates).__name__}: {dates}")
+                    continue
                 if not dates:
                     print(f"  {theater.name}: no operational dates (skipping)")
                     continue
@@ -299,11 +313,14 @@ class CGVCrawler(BaseCrawler):
             payloads = await asyncio.gather(*[
                 self._fetch_screenings(worker_for(i), t.cinema_code, d)
                 for i, (t, d) in enumerate(jobs)
-            ])
+            ], return_exceptions=True)
 
         seen: set[tuple] = set()
         per_theater: dict[str, int] = {}
-        for (theater, _), items in zip(jobs, payloads):
+        for (theater, scn_ymd), items in zip(jobs, payloads):
+            if isinstance(items, BaseException):
+                print(f"  ⚠ {theater.name} {scn_ymd}: schedule fetch raised {type(items).__name__}: {items}")
+                continue
             for item in items:
                 key = (
                     item.get("siteNo"),

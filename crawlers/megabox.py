@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import html
+import os
 import re
 
 import httpx
@@ -13,6 +14,11 @@ from models import Cinema, Chain, Screening
 
 _URL = "https://www.megabox.co.kr/on/oh/ohc/Brch/schedulePage.do"
 _BOOKING_LIST_URL = "https://www.megabox.co.kr/on/oh/ohb/SimpleBooking/selectBokdList.do"
+
+# Megabox bans the egress IP after a burst (~75 requests at ~200 req/s drops
+# the connection on the rest). Probed up to 10 req/s sustained with 100% success;
+# 5 req/s (200ms) gives 2x headroom. Tune via env if Megabox tightens later.
+_MIN_REQUEST_INTERVAL_S = float(os.getenv("MEGABOX_MIN_INTERVAL_S", "0.2"))
 _HEADERS = {
     "Content-Type": "application/json",
     "X-Requested-With": "XMLHttpRequest",
@@ -71,6 +77,28 @@ def fetch_megabox_cinema_list(area_code: str | None = SEOUL_AREA_CODE) -> list[d
     return cinemas
 
 
+class _RateLimiter:
+    """Enforces a minimum interval between request starts.
+
+    Megabox enforces a per-IP burst threshold (TCP RST after ~75 fast requests).
+    A simple inter-arrival gate keeps sustained throughput well below it.
+    """
+
+    def __init__(self, min_interval: float):
+        self._min_interval = min_interval
+        self._next_allowed = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            wait = self._next_allowed - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = asyncio.get_event_loop().time()
+            self._next_allowed = now + self._min_interval
+
+
 class MegaboxCrawler(BaseCrawler):
     chain: Chain = "Megabox"
 
@@ -85,7 +113,7 @@ class MegaboxCrawler(BaseCrawler):
     async def _fetch(
         self,
         client: httpx.AsyncClient,
-        sem: asyncio.Semaphore,
+        limiter: _RateLimiter,
         theater: Cinema,
         play_de: str,
         first: bool,
@@ -99,14 +127,17 @@ class MegaboxCrawler(BaseCrawler):
             "crtDe": dt.date.today().strftime("%Y%m%d"),
             "playDe": play_de,
         }
-        async with sem:
-            try:
-                resp = await client.post(_URL, json=body, headers=_HEADERS)
-                resp.raise_for_status()
-                return resp.json()
-            except Exception as e:
-                print(f"  ⚠ {theater.name} playDe={play_de} fetch failed: {e}")
-                return None
+        await limiter.acquire()
+        try:
+            resp = await client.post(_URL, json=body, headers=_HEADERS)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            # httpx.RemoteProtocolError surfaces with empty str(e); include class
+            # so the log distinguishes WAF-ban vs timeout vs other failure modes.
+            print(f"  ⚠ {theater.name} playDe={play_de} fetch failed: "
+                  f"{type(e).__name__}: {e}")
+            return None
 
     def _items_to_screenings(
         self, theater: Cinema, items: list[dict], crawl_ts: dt.datetime
@@ -161,17 +192,24 @@ class MegaboxCrawler(BaseCrawler):
         crawl_ts = dt.datetime.utcnow()
         today_str = dt.date.today().strftime("%Y%m%d")
 
-        sem = asyncio.Semaphore(8)
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        # Single shared limiter pacing every request — schedulePage burst at
+        # ~200 req/s gets the IP banned mid-batch; 5 req/s sustains cleanly.
+        limiter = _RateLimiter(min_interval=_MIN_REQUEST_INTERVAL_S)
+        async with httpx.AsyncClient(timeout=20.0) as client:
             # One firstAt=Y call per theater returns both the date list AND today's
             # screenings — reuse the latter to save a call per theater.
             print(f"  Fetching operational dates for {len(self.theaters)} theaters...")
             first_results = await asyncio.gather(*[
-                self._fetch(client, sem, t, today_str, first=True) for t in self.theaters
-            ])
+                self._fetch(client, limiter, t, today_str, first=True)
+                for t in self.theaters
+            ], return_exceptions=True)
 
             jobs: list[tuple[Cinema, str]] = []
             for theater, data in zip(self.theaters, first_results):
+                if isinstance(data, BaseException):
+                    print(f"  ⚠ {theater.name}: dates fetch raised "
+                          f"{type(data).__name__}: {data}")
+                    continue
                 if not data:
                     continue
                 mm = data.get("megaMap") or {}
@@ -194,9 +232,13 @@ class MegaboxCrawler(BaseCrawler):
             if jobs:
                 print(f"  Fetching schedules for {len(jobs)} (theater × date) pairs...")
                 payloads = await asyncio.gather(*[
-                    self._fetch(client, sem, t, d, first=False) for t, d in jobs
-                ])
-                for (theater, _), data in zip(jobs, payloads):
+                    self._fetch(client, limiter, t, d, first=False) for t, d in jobs
+                ], return_exceptions=True)
+                for (theater, scn_ymd), data in zip(jobs, payloads):
+                    if isinstance(data, BaseException):
+                        print(f"  ⚠ {theater.name} {scn_ymd}: schedule fetch raised "
+                              f"{type(data).__name__}: {data}")
+                        continue
                     if not data:
                         continue
                     items = (data.get("megaMap") or {}).get("movieFormList") or []
