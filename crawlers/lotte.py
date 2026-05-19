@@ -95,7 +95,11 @@ class LotteCinemaCrawler(BaseCrawler):
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
-                print(f"  ⚠ Lotte API call failed ({param.get('MethodName')}): {e}")
+                # Include exception class — httpx.RemoteProtocolError/ReadError
+                # surface with empty str(e), so without the class name we can't
+                # distinguish WAF disconnect from timeout from other failures.
+                print(f"  ⚠ Lotte API call failed ({param.get('MethodName')}): "
+                      f"{type(e).__name__}: {e}")
                 return None
 
     async def _fetch_dates(
@@ -189,12 +193,18 @@ class LotteCinemaCrawler(BaseCrawler):
         sem = asyncio.Semaphore(8)
         async with httpx.AsyncClient(timeout=15.0) as client:
             print(f"  Fetching operational dates for {len(self.theaters)} theaters...")
+            # return_exceptions=True so any uncaught error in one task can't
+            # cascade through gather and tear down the whole chain.
             date_lists = await asyncio.gather(*[
                 self._fetch_dates(client, sem, t) for t in self.theaters
-            ])
+            ], return_exceptions=True)
 
             jobs: list[tuple[Cinema, str]] = []
             for theater, dates in zip(self.theaters, date_lists):
+                if isinstance(dates, BaseException):
+                    print(f"  ⚠ {theater.name}: dates fetch raised "
+                          f"{type(dates).__name__}: {dates}")
+                    continue
                 print(f"  {theater.name}: {len(dates)} operational dates")
                 for d in dates:
                     jobs.append((theater, d))
@@ -203,8 +213,12 @@ class LotteCinemaCrawler(BaseCrawler):
                 print(f"  Fetching schedules for {len(jobs)} (theater × date) pairs...")
                 payloads = await asyncio.gather(*[
                     self._fetch_screenings(client, sem, t, d) for t, d in jobs
-                ])
-                for (theater, _), items in zip(jobs, payloads):
+                ], return_exceptions=True)
+                for (theater, play_date), items in zip(jobs, payloads):
+                    if isinstance(items, BaseException):
+                        print(f"  ⚠ {theater.name} {play_date}: schedule fetch raised "
+                              f"{type(items).__name__}: {items}")
+                        continue
                     for item in items:
                         try:
                             s = self._to_screening(theater, item, crawl_ts)
