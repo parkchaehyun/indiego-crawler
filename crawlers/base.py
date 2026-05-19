@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import logging
 from typing import List, get_args
 
@@ -36,7 +37,9 @@ class BaseCrawler(abc.ABC):
         if not screenings:
             return
         try:
-            self.supabase.insert_screenings(screenings)
+            # supabase-py uses blocking httpx; offload so concurrent chain
+            # uploads don't stall each other's in-flight crawl requests.
+            await asyncio.to_thread(self.supabase.insert_screenings, screenings)
             print(f"✅ Supabase insert successful for {self.chain}")
         except Exception as exc:
             print(f"❌ Supabase save error for {self.chain}: {exc}")
