@@ -2,15 +2,15 @@ import asyncio
 from crawlers.crawler_registry import CrawlerRegistry
 from crawlers.supabase_client import SupabaseClient
 
+_MAX_CHAIN_RETRIES = 1
+
+
 def lambda_handler(event, context):
     chains = event.get(
         "chains",
         ["CGV", "Megabox", "Lotte", "CineQ", "TinyTicket", "Dtryx", "Moviee", "KOFA"],
     )
     supabase = SupabaseClient()
-
-    failed = []
-    succeeded = []
 
     async def run_one(chain: str):
         try:
@@ -25,17 +25,23 @@ def lambda_handler(event, context):
             return chain, e
 
     async def run_all():
-        # Chains hit independent upstreams, so overlapping their crawl phases
-        # cuts wall-clock without changing per-chain behavior. Supabase writes
-        # naturally serialize on the shared client; that's fine since the crawl
-        # dominates each chain's runtime.
-        return await asyncio.gather(*[run_one(c) for c in chains])
+        results = dict(await asyncio.gather(*[run_one(c) for c in chains]))
 
-    for chain, err in asyncio.run(run_all()):
-        (failed if err is not None else succeeded).append(chain)
+        for retry_round in range(1, _MAX_CHAIN_RETRIES + 1):
+            failed = [c for c, err in results.items() if err is not None]
+            if not failed:
+                break
+            print(f"⟳ Retry {retry_round}/{_MAX_CHAIN_RETRIES}: re-running {failed}")
+            retried = dict(await asyncio.gather(*[run_one(c) for c in failed]))
+            results.update(retried)
+
+        return results
+
+    results = asyncio.run(run_all())
+    failed = [c for c, err in results.items() if err is not None]
+    succeeded = [c for c, err in results.items() if err is None]
 
     if failed:
-        # Raise so EventBridge/scheduled Lambda marks the invocation as failed.
         raise RuntimeError(f"Failed chains: {failed}")
     return {
         "statusCode": 200,

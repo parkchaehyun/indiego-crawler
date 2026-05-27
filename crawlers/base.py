@@ -8,6 +8,11 @@ from models import Chain, Cinema, Screening
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Limit concurrent Supabase writes to avoid overwhelming the connection pool.
+_db_write_sem = asyncio.Semaphore(1)
+
+_SAVE_MAX_ATTEMPTS = 3
+
 
 class BaseCrawler(abc.ABC):
     chain: Chain
@@ -36,14 +41,29 @@ class BaseCrawler(abc.ABC):
     async def save_to_db(self, screenings: List) -> None:
         if not screenings:
             return
-        try:
-            # supabase-py uses blocking httpx; offload so concurrent chain
-            # uploads don't stall each other's in-flight crawl requests.
-            await asyncio.to_thread(self.supabase.insert_screenings, screenings)
-            print(f"✅ Supabase insert successful for {self.chain}")
-        except Exception as exc:
-            print(f"❌ Supabase save error for {self.chain}: {exc}")
-            raise
+        async with _db_write_sem:
+            for attempt in range(1, _SAVE_MAX_ATTEMPTS + 1):
+                try:
+                    await asyncio.to_thread(
+                        self.supabase.insert_screenings, screenings
+                    )
+                    print(f"✅ Supabase insert successful for {self.chain}")
+                    return
+                except Exception as exc:
+                    if attempt < _SAVE_MAX_ATTEMPTS:
+                        wait = 2 ** attempt
+                        print(
+                            f"⚠ Supabase insert failed for {self.chain} "
+                            f"(attempt {attempt}/{_SAVE_MAX_ATTEMPTS}): {exc}"
+                        )
+                        print(f"  Retrying in {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        print(
+                            f"❌ Supabase save error for {self.chain} "
+                            f"after {_SAVE_MAX_ATTEMPTS} attempts: {exc}"
+                        )
+                        raise
 
     @abc.abstractmethod
     async def run(self) -> list[Screening]:
